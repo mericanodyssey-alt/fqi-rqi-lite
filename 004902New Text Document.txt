@@ -1,0 +1,9 @@
+cd C:\Users\meric\Desktop\ds004902
+python rqi_lite_fixed_v2.py ^
+  --data-path "C:\Users\meric\Desktop\ds004902\sub-01" ^
+  --pattern "*.set" ^
+  --cond-a "ses-1" ^
+  --cond-b "ses-2" ^
+  --sfreq 250 --bandpass 1 40 --epoch-sec 2 --step-sec 1 ^
+  --max-ch 16 --max-triads 100 --notch 60 ^
+  --outdir "rqi_out_01"

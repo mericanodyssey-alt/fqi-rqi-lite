@@ -1,0 +1,257 @@
+﻿#!/usr/bin/env python3
+"""
+RQI-Lite Proof of Concept (patched v2)
+- Fixes Tigramite import path (v5.x)
+- Fixes Gaussian entropy to handle 1D covariance (np.cov on a single channel)
+"""
+import argparse, glob, os, random, math
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import mne
+mne.set_config("MNE_USE_IIR_FILTERS", "true")
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Tigramite for PCMCI (partial correlation) — patched import
+from tigramite import data_processing as pp
+from tigramite.independence_tests.parcorr import ParCorr
+from tigramite.pcmci import PCMCI
+
+from scipy.stats import zscore, ttest_ind
+
+def bandpass_notch_resample(raw: mne.io.BaseRaw, l_freq: float, h_freq: float, notch: float|None, sfreq: float):
+    raw = raw.copy().load_data()
+    if notch:
+        raw.notch_filter(np.atleast_1d(notch), fir_design="firwin")
+    raw.filter(l_freq=l_freq, h_freq=h_freq, fir_design="firwin")
+    if sfreq and abs(raw.info["sfreq"] - sfreq) > 1e-3:
+        raw.resample(sfreq)
+    return raw
+
+def epoch_array(raw: mne.io.BaseRaw, epoch_sec: float, step_sec: float):
+    X = raw.get_data()  # shape (n_channels, n_times)
+    sf = raw.info["sfreq"]
+    win = int(epoch_sec * sf)
+    step = int(step_sec * sf)
+    n = X.shape[1]
+    starts = np.arange(0, max(0, n - win + 1), step, dtype=int)
+    epochs = [X[:, s:s+win] for s in starts if s+win <= n]
+    return np.stack(epochs, axis=0)  # (n_epochs, n_channels, win)
+
+def pick_files(data_path, pattern, contains_substr):
+    files = [p for p in glob.glob(os.path.join(data_path, "**", pattern), recursive=True) if contains_substr.lower() in os.path.basename(p).lower()]
+    return sorted(files)
+
+def load_one_file(path):
+    ext = Path(path).suffix.lower()
+    if ext == ".edf":
+        return mne.io.read_raw_edf(path, preload=True, verbose=False)
+    if ext in (".fif",):
+        return mne.io.read_raw_fif(path, preload=True, verbose=False)
+    if ext in (".vhdr",):  # BrainVision
+        return mne.io.read_raw_brainvision(path, preload=True, verbose=False)
+    if ext in (".set",):   # 👈 NEW: EEGLAB
+        return mne.io.read_raw_eeglab(path, preload=True, verbose=False)
+    raise ValueError(f"Unsupported file type: {ext} for {path}")
+
+
+def standardize_epochs(epochs):
+    e = epochs.copy()
+    e = (e - e.mean(axis=2, keepdims=True)) / (e.std(axis=2, keepdims=True) + 1e-8)
+    return e
+
+def _H_gauss(cov):
+    """Gaussian differential entropy from covariance.
+    Handles scalar (1D) or full matrices robustly.
+    H = 0.5 * ln((2*pi*e)^k * det(Sigma))
+    """
+    cov = np.atleast_2d(np.asarray(cov, dtype=float))
+    # Numerical safety: symmetrize
+    cov = 0.5 * (cov + cov.T)
+    # Ensure positive semidefinite
+    # Clip tiny negatives caused by float error
+    w, v = np.linalg.eigh(cov)
+    w = np.clip(w, 1e-12, None)
+    cov = (v * w) @ v.T
+    k = cov.shape[0]
+    det = float(np.linalg.det(cov))
+    det = max(det, 1e-12)
+    return 0.5 * np.log(((2*np.pi*np.e)**k) * det)
+
+def gaussian_o_information(X):
+    """
+    Gaussian O-information for 3 channels X with shape (3, n_times).
+    O3 = sum H(X_i) - 2*sum H(X_i, X_j) + 3*H(X1, X2, X3)
+    """
+    # Individual entropies (force 1x1 covariance for univariate)
+    H1 = _H_gauss(np.cov(np.atleast_2d(X[0])))
+    H2 = _H_gauss(np.cov(np.atleast_2d(X[1])))
+    H3 = _H_gauss(np.cov(np.atleast_2d(X[2])))
+    # Pair entropies
+    H12 = _H_gauss(np.cov(np.vstack([X[0], X[1]])))
+    H13 = _H_gauss(np.cov(np.vstack([X[0], X[2]])))
+    H23 = _H_gauss(np.cov(np.vstack([X[1], X[2]])))
+    # Joint entropy
+    H123 = _H_gauss(np.cov(np.vstack([X[0], X[1], X[2]])))
+    O3 = (H1 + H2 + H3) - 2*(H12 + H13 + H23) + 3*H123
+    return float(O3)
+
+def compute_synergy_gauss(epoch, max_triads=150, random_state=0):
+    rng = np.random.default_rng(random_state)
+    C = epoch.shape[0]
+    if C < 3:
+        return np.nan
+    triads = set()
+    max_all = math.comb(C, 3)
+    while len(triads) < min(max_triads, max_all):
+        tri = tuple(sorted(rng.choice(C, size=3, replace=False)))
+        triads.add(tri)
+        if len(triads) == max_all:
+            break
+    O_vals = []
+    for (i, j, k) in triads:
+        X = epoch[[i, j, k], :]
+        try:
+            O_vals.append(gaussian_o_information(X))
+        except Exception:
+            continue
+    if len(O_vals) == 0:
+        return np.nan
+    return float(np.nanmean(O_vals))
+
+def pcmci_global_efficiency(epoch, tau_max=1):
+    X = epoch.T  # (n_times, n_channels)
+    dataframe = pp.DataFrame(X, datatime=np.arange(X.shape[0]))
+    parcorr = ParCorr(significance='analytic')
+    pcmci = PCMCI(dataframe=dataframe, cond_ind_test=parcorr)
+    results = pcmci.run_pcmci(tau_max=tau_max, pc_alpha=None)
+    val_matrix = results.get("val_matrix")
+    A = np.abs(val_matrix[:, :, 0])  # lag 1
+    np.fill_diagonal(A, 0.0)
+    W = np.maximum(A, A.T)
+    # Robust thresholding
+    nz = W[W > 0]
+    if nz.size == 0:
+        return np.nan
+    thresh = np.quantile(nz, 0.8)
+    W_thr = (W >= thresh).astype(float)
+    G = nx.from_numpy_array(W_thr)
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+        return np.nan
+    return nx.global_efficiency(G)
+
+def cohen_d(a, b):
+    a = np.asarray(a); b = np.asarray(b)
+    na, nb = len(a), len(b)
+    sa, sb = a.std(ddof=1), b.std(ddof=1)
+    s_pooled = np.sqrt(((na-1)*sa**2 + (nb-1)*sb**2) / (na+nb-2))
+    return (a.mean() - b.mean()) / (s_pooled + 1e-12)
+
+def process_file(path, args):
+    raw = load_one_file(path)
+    raw = bandpass_notch_resample(raw, args.bandpass[0], args.bandpass[1], args.notch, args.sfreq)
+    if args.max_ch and raw.info["nchan"] > args.max_ch:
+        picks = mne.pick_types(raw.info, eeg=True)[:args.max_ch]
+        raw.pick(picks)
+    epochs = epoch_array(raw, args.epoch_sec, args.step_sec)
+    epochs = standardize_epochs(epochs)
+    return epochs
+
+def compute_metrics(epochs, args, rng_seed=0):
+    phi_vals, syn_vals = [], []
+    for e_idx in range(epochs.shape[0]):
+        ep = epochs[e_idx]
+        phi = pcmci_global_efficiency(ep, tau_max=1)
+        syn = compute_synergy_gauss(ep, max_triads=args.max_triads, random_state=rng_seed + e_idx)
+        phi_vals.append(phi); syn_vals.append(syn)
+    return np.array(phi_vals), np.array(syn_vals)
+
+def main():
+    ap = argparse.ArgumentParser(description="RQI-Lite (Φ_proxy + Syn_Gauss) proof-of-concept — patched v2")
+    ap.add_argument("--data-path", type=str, required=True)
+    ap.add_argument("--pattern", type=str, default="*.vhdr")
+    ap.add_argument("--cond-a", type=str, required=True, help="substring for condition A (e.g., awake)")
+    ap.add_argument("--cond-b", type=str, required=True, help="substring for condition B (e.g., sed2)")
+    ap.add_argument("--sfreq", type=float, default=250)
+    ap.add_argument("--bandpass", type=float, nargs=2, default=[1.0, 40.0])
+    ap.add_argument("--notch", type=float, default=None)
+    ap.add_argument("--epoch-sec", type=float, default=2.0)
+    ap.add_argument("--step-sec", type=float, default=1.0)
+    ap.add_argument("--max-ch", type=int, default=32)
+    ap.add_argument("--max-triads", type=int, default=150)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--outdir", type=str, default="rqi_out")
+    args = ap.parse_args()
+
+    outdir = Path(args.outdir); outdir.mkdir(parents=True, exist_ok=True)
+
+    files_a = pick_files(args.data_path, args.pattern, args.cond_a)
+    files_b = pick_files(args.data_path, args.pattern, args.cond_b)
+    if len(files_a) == 0 or len(files_b) == 0:
+        raise SystemExit(f"No files found for A={args.cond_a} or B={args.cond_b}. Check names and pattern.")
+
+    print(f"Found {len(files_a)} files for A, {len(files_b)} files for B.")
+
+    Phi_A, Syn_A, Phi_B, Syn_B = [], [], [], []
+    for path in files_a:
+        epochs = process_file(path, args)
+        phi, syn = compute_metrics(epochs, args, rng_seed=args.seed)
+        Phi_A.extend(list(phi)); Syn_A.extend(list(syn))
+
+    for path in files_b:
+        epochs = process_file(path, args)
+        phi, syn = compute_metrics(epochs, args, rng_seed=args.seed + 1337)
+        Phi_B.extend(list(phi)); Syn_B.extend(list(syn))
+
+    Phi_A, Syn_A = np.array(Phi_A), np.array(Syn_A)
+    Phi_B, Syn_B = np.array(Phi_B), np.array(Syn_B)
+
+    # Drop NaNs safely
+    mask_A = ~np.isnan(Phi_A) & ~np.isnan(Syn_A)
+    mask_B = ~np.isnan(Phi_B) & ~np.isnan(Syn_B)
+    Phi_A, Syn_A = Phi_A[mask_A], Syn_A[mask_A]
+    Phi_B, Syn_B = Phi_B[mask_B], Syn_B[mask_B]
+
+    Phi_all = np.concatenate([Phi_A, Phi_B])
+    Syn_all = np.concatenate([Syn_A, Syn_B])
+    Phi_A_z = (Phi_A - np.nanmean(Phi_all)) / (np.nanstd(Phi_all) + 1e-9)
+    Phi_B_z = (Phi_B - np.nanmean(Phi_all)) / (np.nanstd(Phi_all) + 1e-9)
+    Syn_A_z = (Syn_A - np.nanmean(Syn_all)) / (np.nanstd(Syn_all) + 1e-9)
+    Syn_B_z = (Syn_B - np.nanmean(Syn_all)) / (np.nanstd(Syn_all) + 1e-9)
+
+    RQI_A = Phi_A_z + Syn_A_z
+    RQI_B = Phi_B_z + Syn_B_z
+
+    d_phi = cohen_d(Phi_A_z[~np.isnan(Phi_A_z)], Phi_B_z[~np.isnan(Phi_B_z)])
+    d_syn = cohen_d(Syn_A_z[~np.isnan(Syn_A_z)], Syn_B_z[~np.isnan(Syn_B_z)])
+    d_rqi = cohen_d(RQI_A[~np.isnan(RQI_A)], RQI_B[~np.isnan(RQI_B)])
+    t_rqi, p_rqi = ttest_ind(RQI_A[~np.isnan(RQI_A)], RQI_B[~np.isnan(RQI_B)], equal_var=False)
+
+    print(f"Cohen's d — Φ: {d_phi:.3f}, Syn: {d_syn:.3f}, RQI: {d_rqi:.3f}")
+    print(f"Welch t-test RQI: t={t_rqi:.2f}, p={p_rqi:.3e}")
+
+    plt.figure(figsize=(8,5))
+    plt.hist(RQI_A[~np.isnan(RQI_A)], bins=30, alpha=0.6, label=f"A: {args.cond_a}")
+    plt.hist(RQI_B[~np.isnan(RQI_B)], bins=30, alpha=0.6, label=f"B: {args.cond_b}")
+    plt.xlabel("RQI-Lite (z(Φ_proxy)+z(Syn_Gauss))")
+    plt.ylabel("Count")
+    plt.title(f"RQI-Lite separation (d={d_rqi:.2f}, p={p_rqi:.1e})")
+    plt.legend()
+    png_path = Path(args.outdir) / "rqi_lite_hist.png"
+    plt.tight_layout(); plt.savefig(png_path, dpi=160)
+    print(f"Saved figure to: {png_path}")
+
+    df = pd.DataFrame({
+        "group": (["A"]*len(RQI_A)) + (["B"]*len(RQI_B)),
+        "cond": ([args.cond_a]*len(RQI_A)) + ([args.cond_b]*len(RQI_B)),
+        "RQI": list(RQI_A) + list(RQI_B),
+        "Phi_z": list(Phi_A_z) + list(Phi_B_z),
+        "Syn_z": list(Syn_A_z) + list(Syn_B_z),
+    })
+    csv_path = Path(args.outdir) / "rqi_lite_scores.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved scores to: {csv_path}")
+
+if __name__ == "__main__":
+    main()
