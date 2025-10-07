@@ -1,0 +1,3 @@
+SHA256 hash of C:\Users\meric\Desktop\rqi_repro_bundle\rqi_lite_fixed_v2.py:
+e9e8cd0d31d55dbce9ba72a95c161f19de4e8ee81ceb303cd97af0e1d0f3096a
+CertUtil: -hashfile command completed successfully.
