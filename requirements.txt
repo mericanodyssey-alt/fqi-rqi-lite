@@ -1,0 +1,8 @@
+numpy
+scipy
+pandas
+networkx
+matplotlib
+mne
+tigramite
+statsmodels
